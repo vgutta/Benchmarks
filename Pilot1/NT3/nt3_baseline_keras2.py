@@ -16,6 +16,21 @@ from sklearn.preprocessing import MaxAbsScaler
 import nt3 as bmk
 import candle
 
+import tensorflow as tf
+
+############### Horovod #######################
+import horovod.keras as hvd
+
+def comp_epochs(n, myrank=0, nprocs=1):
+    j = int(n // nprocs)
+    k = n % nprocs
+    if myrank < nprocs-1:
+        i = j
+    else:
+        i = j + k
+        return i
+###############################################
+
 
 def initialize_parameters(default_model='nt3_default_model.txt'):
 
@@ -85,6 +100,29 @@ def load_data(train_path, test_path, gParameters):
 
 
 def run(gParameters):
+
+    ##### initialize Horovod ##########################
+    hvd.init()
+
+    # Horovod: pin GPU to be used to process local rank (one GPU per process)
+    """gpus = tf.config.experimental.list_physical_devices('GPU')
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    if gpus:
+        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')"""
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    K.set_session(tf.Session(config=config))
+
+    nprocs = hvd.size()
+    myrank = hvd.rank()
+
+    epochs = comp_epochs(gParameters['epochs'], myrank, nprocs)
+    gParameters['epochs'] = epochs
+
+    ####################################################
+
 
     file_train = gParameters['train_data']
     file_test = gParameters['test_data']
@@ -186,6 +224,11 @@ def run(gParameters):
                                        gParameters['learning_rate'],
                                        kerasDefaults)
 
+    ################# Horovod ####################
+    optimizer = hvd.DistributedOptimizer(optimizer)
+    ##############################################
+
+
     model.summary()
     model.compile(loss=gParameters['loss'],
                   optimizer=optimizer,
@@ -208,11 +251,25 @@ def run(gParameters):
     candleRemoteMonitor = candle.CandleRemoteMonitor(params=gParameters)
     timeoutMonitor = candle.TerminateOnTimeOut(gParameters['timeout'])
 
+    ############# Horovod Callbacks #########################
+    callbacks = [
+        # Horovod: broadcast initial variable states from rank 0 to all other processes.
+        # This is necessary to ensure consistent initialization of all workers when
+        # training is started with random weights or restored from a checkpoint.
+        hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+    ]
+
+    # Horovod: save checkpoints only on worker 0 to prevent other workers from corrupting them.
+    if hvd.rank() == 0:
+        callbacks.append(keras.callbacks.ModelCheckpoint('./checkpoint-{epoch}.h5'))
+
+    ########################################################
+
     history = model.fit(X_train, Y_train,
                         batch_size=gParameters['batch_size'],
                         epochs=gParameters['epochs'],
                         initial_epoch=initial_epoch,
-                        verbose=1,
+                        verbose=1 if hvd.rank() == 0 else 0,
                         validation_data=(X_test, Y_test),
                         callbacks=[csv_logger, reduce_lr, candleRemoteMonitor, timeoutMonitor,
                                    ckpt])
