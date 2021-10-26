@@ -5,6 +5,7 @@ import numpy as np
 import os
 
 from tensorflow.keras import backend as K
+#from tensorflow.python.keras import backend as K
 
 from tensorflow.keras.layers import Dense, Dropout, Activation, Conv1D, MaxPooling1D, Flatten, LocallyConnected1D
 from tensorflow.keras.models import Sequential, model_from_json, model_from_yaml
@@ -19,7 +20,7 @@ import candle
 import tensorflow as tf
 
 ############### Horovod #######################
-import horovod.keras as hvd
+import horovod.tensorflow.keras as hvd
 
 def comp_epochs(n, myrank=0, nprocs=1):
     j = int(n // nprocs)
@@ -105,21 +106,23 @@ def run(gParameters):
     hvd.init()
 
     # Horovod: pin GPU to be used to process local rank (one GPU per process)
-    """gpus = tf.config.experimental.list_physical_devices('GPU')
+    gpus = tf.config.experimental.list_physical_devices('GPU')
     for gpu in gpus:
         tf.config.experimental.set_memory_growth(gpu, True)
     if gpus:
-        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')"""
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    config.gpu_options.visible_device_list = str(hvd.local_rank())
-    K.set_session(tf.Session(config=config))
+        tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+    #config = tf.compat.v1.ConfigProto()
+    #config.gpu_options.allow_growth = True
+    #config.gpu_options.visible_device_list = str(hvd.local_rank())
+    #K.set_session(tf.compat.v1.Session(config=config))
 
     nprocs = hvd.size()
     myrank = hvd.rank()
 
+    scaled_lr = gParameters['learning_rate'] * hvd.size()
+
     epochs = comp_epochs(gParameters['epochs'], myrank, nprocs)
-    gParameters['epochs'] = epochs
+    #gParameters['epochs'] = epochs
 
     ####################################################
 
@@ -221,7 +224,7 @@ def run(gParameters):
 
     # Define optimizer
     optimizer = candle.build_optimizer(gParameters['optimizer'],
-                                       gParameters['learning_rate'],
+                                       scaled_lr,
                                        kerasDefaults)
 
     ################# Horovod ####################
@@ -257,11 +260,22 @@ def run(gParameters):
         # This is necessary to ensure consistent initialization of all workers when
         # training is started with random weights or restored from a checkpoint.
         hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+
+        # Horovod: average metrics among workers at the end of every epoch.
+        #
+        # Note: This callback must be in the list before the ReduceLROnPlateau,
+        # TensorBoard or other metrics-based callbacks.
+        #hvd.callbacks.MetricAverageCallback(),
+
+        # Horovod: using `lr = 1.0 * hvd.size()` from the very beginning leads to worse final
+        # accuracy. Scale the learning rate `lr = 1.0` ---> `lr = 1.0 * hvd.size()` during
+        # the first three epochs. See https://arxiv.org/abs/1706.02677 for details.
+        #hvd.callbacks.LearningRateWarmupCallback(initial_lr=scaled_lr, warmup_epochs=3, verbose=1),
     ]
 
     # Horovod: save checkpoints only on worker 0 to prevent other workers from corrupting them.
     if hvd.rank() == 0:
-        callbacks.append(keras.callbacks.ModelCheckpoint('./checkpoint-{epoch}.h5'))
+        callbacks.append(tf.keras.callbacks.ModelCheckpoint('./checkpoint-{epoch}.h5'))
 
     ########################################################
 
@@ -271,8 +285,9 @@ def run(gParameters):
                         initial_epoch=initial_epoch,
                         verbose=1 if hvd.rank() == 0 else 0,
                         validation_data=(X_test, Y_test),
-                        callbacks=[csv_logger, reduce_lr, candleRemoteMonitor, timeoutMonitor,
-                                   ckpt])
+                        #callbacks=[csv_logger, reduce_lr, candleRemoteMonitor, timeoutMonitor,
+                        #          ckpt])
+                        callbacks=callbacks)
 
     score = model.evaluate(X_test, Y_test, verbose=0)
 
